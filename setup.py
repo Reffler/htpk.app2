@@ -1,6 +1,5 @@
 import os
 import sys
-import shutil
 import tarfile
 import zipfile
 import subprocess
@@ -25,8 +24,15 @@ GRADLE_HOME = LIB_DIR / "gradle" / "gradle-7.4"
 ANDROID_HOME = LIB_DIR / "cmdline-tools"
 CMDLINE_TOOLS_BIN = ANDROID_HOME / "latest" / "bin"
 
+
 def log(msg):
     print(f"[SETUP] {msg}")
+
+
+def ensure_executable(path: Path) -> None:
+    if path.exists():
+        os.chmod(path, 0o755)
+
 
 def download_file(url, dest_path):
     if dest_path.exists():
@@ -50,10 +56,7 @@ def extract_archive(file_path, extract_to):
 def setup_java():
     if JAVA_HOME.exists():
         log("JDK 17 is already installed.")
-        # Ensure executable permissions even if already installed
-        java_bin = JAVA_HOME / "bin" / "java"
-        if java_bin.exists():
-            os.chmod(java_bin, 0o755)
+        ensure_executable(JAVA_HOME / "bin" / "java")
         return
 
     jvm_dir = LIB_DIR / "jvm"
@@ -65,17 +68,12 @@ def setup_java():
     archive.unlink() # Cleanup
 
     # FIX: Ensure Java is executable
-    java_bin = JAVA_HOME / "bin" / "java"
-    if java_bin.exists():
-        os.chmod(java_bin, 0o755)
+    ensure_executable(JAVA_HOME / "bin" / "java")
 
 def setup_gradle():
     if GRADLE_HOME.exists():
         log("Gradle 7.4 is already installed.")
-        # FIX: Ensure executable permissions even if already installed
-        gradle_bin = GRADLE_HOME / "bin" / "gradle"
-        if gradle_bin.exists():
-            os.chmod(gradle_bin, 0o755)
+        ensure_executable(GRADLE_HOME / "bin" / "gradle")
         return
 
     gradle_dir = LIB_DIR / "gradle"
@@ -87,9 +85,7 @@ def setup_gradle():
     archive.unlink()
 
     # FIX: Explicitly make Gradle executable
-    gradle_bin = GRADLE_HOME / "bin" / "gradle"
-    if gradle_bin.exists():
-        os.chmod(gradle_bin, 0o755)
+    ensure_executable(GRADLE_HOME / "bin" / "gradle")
 
 def setup_android_sdk():
     target_dir = ANDROID_HOME / "latest"
@@ -118,9 +114,7 @@ def setup_android_sdk():
     env["ANDROID_HOME"] = str(ANDROID_HOME)
     
     sdkmanager = CMDLINE_TOOLS_BIN / "sdkmanager"
-    # Ensure binary is executable
-    if sdkmanager.exists():
-        os.chmod(sdkmanager, 0o755)
+    ensure_executable(sdkmanager)
 
     # Accept licenses and install
     cmd = [
@@ -134,8 +128,23 @@ def setup_android_sdk():
     
     # Pipe 'yes' to accept licenses
     yes_proc = subprocess.Popen(["yes"], stdout=subprocess.PIPE)
-    subprocess.run(cmd, stdin=yes_proc.stdout, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    yes_proc.stdout.close() # Clean up
+    try:
+        subprocess.run(
+            cmd,
+            stdin=yes_proc.stdout,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    finally:
+        if yes_proc.stdout:
+            yes_proc.stdout.close()
+        yes_proc.terminate()
+        try:
+            yes_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            yes_proc.kill()
 
 def generate_keystore():
     keystore_path = ANDROID_DIR / "app" / "my-release-key.jks"
@@ -145,8 +154,7 @@ def generate_keystore():
 
     log("Generating signing keystore...")
     keytool = JAVA_HOME / "bin" / "keytool"
-    if keytool.exists():
-        os.chmod(keytool, 0o755)
+    ensure_executable(keytool)
     
     cmd = [
         str(keytool), "-genkey", "-v",
@@ -171,14 +179,14 @@ def main():
     
     # Make make.sh executable
     if MAKE_SH_PATH.exists():
-        os.chmod(MAKE_SH_PATH, 0o755)
+        ensure_executable(MAKE_SH_PATH)
 
     # Run Setup Steps
     try:
         setup_java()
         setup_gradle()
         setup_android_sdk()
-        setup_keystore = generate_keystore()
+        generate_keystore()
     except Exception as e:
         print(f"\n[ERROR] Setup failed: {e}")
         sys.exit(1)
