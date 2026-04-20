@@ -12,17 +12,17 @@ import asyncio
 import http.server
 import json
 import os
-import re
 import shutil
 import socketserver
 import subprocess
-import sys
 import threading
+import time
+import urllib.parse
 import uuid
 import zipfile
 from pathlib import Path
 from threading import Lock
-from typing import Annotated, AsyncGenerator
+from typing import Annotated
 
 from litestar import Litestar, get, post
 from litestar.config.cors import CORSConfig
@@ -38,62 +38,11 @@ CACHE_DIR = BASE_DIR / "cache"
 WEB_DIR = BASE_DIR / "web_ui"
 MAKE_SH_PATH = BASE_DIR / "make.sh"
 ICON_FILENAME = "icon.png"
-CONF_FILENAME = "webapk.conf"
+ANDROID_ICON_PATH = ANDROID_DIR / "app/src/main/res/mipmap/ic_launcher.png"
+BUILD_STATE_TTL_SECONDS = 300
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
-
-# --- GIT URL CONVERSION ---
-
-
-def convert_git_to_raw_url(
-    repo_url: str, branch: str = "main", entry_path: str = "index.html"
-) -> str:
-    """
-    Convert a Git repository URL to a served URL for live loading.
-    Uses raw.githack.com for GitHub (serves with correct MIME types as web pages).
-    """
-    import urllib.parse
-
-    parsed = urllib.parse.urlparse(repo_url)
-    host = parsed.netloc.lower()
-    path = parsed.path.rstrip("/")
-
-    # Remove .git suffix if present
-    if path.endswith(".git"):
-        path = path[:-4]
-
-    # Extract user/repo from path
-    parts = path.strip("/").split("/")
-    if len(parts) < 2:
-        raise ValueError(f"Invalid repository URL: {repo_url}")
-
-    user = parts[0]
-    repo = parts[1]
-
-    # Normalize entry path
-    entry_path = entry_path.lstrip("/")
-
-    # Convert based on host
-    if "github.com" in host:
-        # raw.githack.com serves GitHub files with correct MIME types
-        # Format: https://raw.githack.com/user/repo/branch/path
-        return f"https://raw.githack.com/{user}/{repo}/{branch}/{entry_path}"
-
-    elif "gitlab.com" in host:
-        # GitLab Pages (if enabled)
-        return f"https://{user}.gitlab.io/{repo}/{entry_path}"
-
-    elif "codeberg.org" in host:
-        # Codeberg Pages
-        return f"https://{user}.codeberg.page/{repo}/{entry_path}"
-
-    else:
-        # Generic: try raw URL
-        return (
-            f"{parsed.scheme}://{host}/{user}/{repo}/raw/branch/{branch}/{entry_path}"
-        )
-
 
 # --- TEMPLATES (ROBUST) ---
 
@@ -160,9 +109,6 @@ android {
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.core:core:1.9.0'
-    implementation 'org.unifiedpush.android:connector:3.0.10'
-    implementation 'androidx.media:media:1.6.0'
-    implementation 'androidx.localbroadcastmanager:localbroadcastmanager:1.1.0'
 
     // REQUIRED: WebKit for WebViewAssetLoader (Fixes ES Modules & CORS)
     implementation 'androidx.webkit:webkit:1.6.0'
@@ -185,8 +131,6 @@ import android.widget.ProgressBar;
 import android.os.Build;
 import android.graphics.Color;
 import androidx.core.view.WindowCompat;
-import android.content.Intent;
-import android.net.Uri;
 
 // AssetLoader Import
 import androidx.webkit.WebViewAssetLoader;
@@ -618,6 +562,58 @@ GRADLE_TASKS = [
     (r"BUILD SUCCESSFUL", 95),
 ]
 
+CLEAN_RETRY_SIGNALS = (
+    "duplicate class",
+    "already exists",
+    "already defined",
+    "could not delete path",
+    "failed to transform",
+)
+
+
+def prune_build_states() -> None:
+    now = time.time()
+    with build_states_lock:
+        expired = [
+            build_id
+            for build_id, state in build_states.items()
+            if state.get("expires_at", 0) and state["expires_at"] <= now
+        ]
+        for build_id in expired:
+            build_states.pop(build_id, None)
+
+
+def set_build_state(build_id: str, **updates: object) -> None:
+    updates["updated_at"] = time.time()
+    with build_states_lock:
+        state = build_states.get(build_id)
+        if not state:
+            return
+        state.update(updates)
+
+
+def decode_process_error(err: subprocess.CalledProcessError) -> str:
+    output: bytes | str | None = err.output if err.output is not None else err.stdout
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return str(output or "")
+
+
+def should_retry_with_clean(output_text: str) -> bool:
+    lowered = output_text.lower()
+    return any(signal in lowered for signal in CLEAN_RETRY_SIGNALS)
+
+
+def parse_git_repo(repo_url: str) -> dict[str, str]:
+    parsed = urllib.parse.urlparse(repo_url)
+    path = parsed.path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.strip("/").split("/")
+    if len(parts) < 2:
+        raise ValueError(f"Invalid repository URL: {repo_url}")
+    return {"user": parts[0], "repo": parts[1]}
+
 
 def run_command(command: list[str], cwd: Path, output_target_dir: Path = None) -> None:
     env = os.environ.copy()
@@ -686,33 +682,27 @@ def run_gradle_with_progress(
                     else:
                         current_task = pattern
 
-                    with build_states_lock:
-                        build_states[build_id].update(
-                            {
-                                "progress": last_progress,
-                                "message": f"Building: {current_task}",
-                                "status": "in_progress",
-                            }
-                        )
+                    set_build_state(
+                        build_id,
+                        progress=last_progress,
+                        message=f"Building: {current_task}",
+                        status="in_progress",
+                    )
                 break
 
         # Also check for downloading dependencies (first build)
         if "Downloading" in line_stripped or "Download" in line_stripped:
-            with build_states_lock:
-                build_states[build_id].update(
-                    {
-                        "message": "Downloading dependencies...",
-                        "status": "in_progress",
-                    }
-                )
+            set_build_state(
+                build_id,
+                message="Downloading dependencies...",
+                status="in_progress",
+            )
         elif "Compiling" in line_stripped:
-            with build_states_lock:
-                build_states[build_id].update(
-                    {
-                        "message": "Compiling source code...",
-                        "status": "in_progress",
-                    }
-                )
+            set_build_state(
+                build_id,
+                message="Compiling source code...",
+                status="in_progress",
+            )
 
     process.wait()
 
@@ -721,11 +711,6 @@ def run_gradle_with_progress(
         raise subprocess.CalledProcessError(
             process.returncode, command, output=output_text.encode()
         )
-
-
-def write_conf(app_id: str, name: str, target_path: Path) -> None:
-    content = f"id = {app_id}\nname = {name}\nicon = {ICON_FILENAME}\n"
-    target_path.write_text(content, encoding="utf-8")
 
 
 def overwrite_android_files(
@@ -779,12 +764,48 @@ def overwrite_android_files(
     )
 
 
+def write_android_icon(icon_data: bytes) -> None:
+    ANDROID_ICON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ANDROID_ICON_PATH.write_bytes(icon_data)
+
+
+def run_apk_build_with_retry(build_id: str, output_target_dir: Path) -> None:
+    command = ["bash", str(MAKE_SH_PATH), "apk"]
+    try:
+        run_gradle_with_progress(
+            command,
+            cwd=BASE_DIR,
+            build_id=build_id,
+            base_progress=50,
+            output_target_dir=output_target_dir,
+        )
+        return
+    except subprocess.CalledProcessError as gradle_error:
+        output_text = decode_process_error(gradle_error)
+        if not should_retry_with_clean(output_text):
+            raise
+        set_build_state(
+            build_id,
+            progress=52,
+            message="Build cache conflict detected. Cleaning and retrying...",
+            status="in_progress",
+        )
+        run_command(["bash", str(MAKE_SH_PATH), "clean"], cwd=BASE_DIR)
+        run_gradle_with_progress(
+            command,
+            cwd=BASE_DIR,
+            build_id=build_id,
+            base_progress=55,
+            output_target_dir=output_target_dir,
+        )
+
+
 def execute_build_async(build_id: str, data: dict) -> None:
     def update(progress, msg, status="in_progress", **kwargs):
-        with build_states_lock:
-            build_states[build_id].update(
-                {"progress": progress, "message": msg, "status": status, **kwargs}
-            )
+        state_update = {"progress": progress, "message": msg, "status": status, **kwargs}
+        if status in {"complete", "error"}:
+            state_update["expires_at"] = time.time() + BUILD_STATE_TTL_SECONDS
+        set_build_state(build_id, **state_update)
 
     try:
         app_id, name = data["app_id"], data["name"]
@@ -792,7 +813,9 @@ def execute_build_async(build_id: str, data: dict) -> None:
         app_output_dir.mkdir(parents=True, exist_ok=True)
 
         update(5, "Preparing assets...")
-        (app_output_dir / ICON_FILENAME).write_bytes(data["icon_data"])
+        icon_data = data["icon_data"]
+        (app_output_dir / ICON_FILENAME).write_bytes(icon_data)
+        write_android_icon(icon_data)
 
         if data["zip_data"]:
             # Local File Mode
@@ -820,19 +843,11 @@ def execute_build_async(build_id: str, data: dict) -> None:
         elif data.get("git_url"):
             # Git Repository Mode - Parse URL for offline-capable build
             update(10, "Configuring Git repository...")
-            import urllib.parse
-
-            parsed = urllib.parse.urlparse(data["git_url"])
-            path = parsed.path.rstrip("/")
-            if path.endswith(".git"):
-                path = path[:-4]
-            parts = path.strip("/").split("/")
-            if len(parts) < 2:
-                raise ValueError(f"Invalid repository URL: {data['git_url']}")
+            parsed_repo = parse_git_repo(data["git_url"])
 
             git_info = {
-                "user": parts[0],
-                "repo": parts[1],
+                "user": parsed_repo["user"],
+                "repo": parsed_repo["repo"],
                 "branch": data.get("git_branch", "main"),
                 "entry": data.get("git_entry", "index.html"),
             }
@@ -840,40 +855,20 @@ def execute_build_async(build_id: str, data: dict) -> None:
             print(
                 f"[BUILDER] Git mode configured for {git_info['user']}/{git_info['repo']}"
             )
-        else:
+        elif data.get("main_url"):
             # URL Mode
             final_url = data["main_url"]
             git_info = None
-
-        update(20, "Cleaning previous builds...")
-        # CRITICAL FIX: Clean build artifacts to prevent crashes from stale cache
-        # We ignore errors here in case clean fails on a fresh run
-        try:
-            run_command(["bash", str(MAKE_SH_PATH), "clean"], cwd=BASE_DIR)
-        except:
-            pass
+        else:
+            raise ValueError("Missing source. Provide ZIP, Git URL, or Website URL.")
 
         update(30, "Configuring project...")
-        conf_path = app_output_dir / CONF_FILENAME
-        write_conf(app_id, name, conf_path)
-
-        # Run make.sh apply_config (handles Manifest updates)
-        run_command(
-            ["bash", str(MAKE_SH_PATH), "apply_config", str(conf_path)], cwd=BASE_DIR
-        )
-
-        # Overwrite source code with correct templates (AssetLoader + Mixed Content)
+        # Overwrite source code with current templates
         update(45, "Injecting source code...")
         overwrite_android_files(app_id, final_url, name, git_info)
 
         update(50, "Building APK...")
-        run_gradle_with_progress(
-            ["bash", str(MAKE_SH_PATH), "apk"],
-            cwd=BASE_DIR,
-            build_id=build_id,
-            base_progress=50,
-            output_target_dir=app_output_dir,
-        )
+        run_apk_build_with_retry(build_id=build_id, output_target_dir=app_output_dir)
 
         update(96, "Verifying APK...")
         final_apk = app_output_dir / f"{app_id}.apk"
@@ -890,7 +885,9 @@ def execute_build_async(build_id: str, data: dict) -> None:
         )
 
     except subprocess.CalledProcessError as e:
-        error_msg = f"Command failed: {e.cmd}\nOutput:\n{e.stdout.decode('utf-8', errors='replace')}"
+        error_msg = (
+            f"Command failed: {e.cmd}\nOutput:\n{decode_process_error(e)}"
+        )
         print(f"Build Error: {error_msg}")
         update(0, "Build failed. Check console for details.", "error", error=error_msg)
     except Exception as e:
@@ -905,12 +902,14 @@ def execute_build_async(build_id: str, data: dict) -> None:
 async def build_apk(
     data: Annotated[dict, Body(media_type=RequestEncodingType.MULTI_PART)],
 ) -> dict:
+    prune_build_states()
     build_id = str(uuid.uuid4())
     with build_states_lock:
         build_states[build_id] = {
             "status": "in_progress",
             "progress": 0,
             "message": "Starting...",
+            "created_at": time.time(),
         }
 
     thread_data = {
@@ -934,6 +933,7 @@ async def stream_progress(build_id: str) -> Stream:
     async def generator():
         last = None
         while True:
+            prune_build_states()
             with build_states_lock:
                 state = build_states.get(build_id)
             if not state:
@@ -957,6 +957,7 @@ async def stream_progress(build_id: str) -> Stream:
 
 @get("/download-apk/{build_id:str}")
 async def download(build_id: str) -> File:
+    prune_build_states()
     with build_states_lock:
         state = build_states.get(build_id)
     if not state or state["status"] != "complete":
